@@ -80,8 +80,6 @@ for source and test status.
 #include <chrono>
 #include <mutex>
 #include <optional>
-#include <string>
-#include <string_view>
 #include <vector>
 
 namespace {
@@ -261,8 +259,8 @@ void UpdateMenuIndex(const F::IInspectable& model, Selection& selection,
         const auto requested = std::ranges::find(selection.names, pending->applied);
         if (requested != selection.names.end() && UniqueName(selection, pending->applied)) {
             const auto index = static_cast<uint32_t>(requested - selection.names.begin());
-            if (reported && *reported == index) pending->verifyUntil = 0;
             selection.index = static_cast<int32_t>(index);
+            if (reported && *reported == index) pendingSelections.erase(pending);
             return;
         }
     }
