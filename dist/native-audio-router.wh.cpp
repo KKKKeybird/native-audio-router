@@ -7,9 +7,9 @@
 // @author KKKKeybird
 // @github https://github.com/KKKKeybird
 // @homepage https://github.com/KKKKeybird/native-audio-router
-// @architecture amd64
+// @architecture x86-64
 // @include ShellHost.exe
-// @compilerOptions -lruntimeobject -loleaut32 -lole32
+// @compilerOptions -lruntimeobject -loleaut32 -lole32 -ladvapi32
 // @license MIT
 // ==/WindhawkMod==
 
@@ -19,33 +19,60 @@
 
 Adds an output-device menu to application volume rows in Windows 11 Quick
 Settings. Use a row's arrow to select a device or follow the system default.
-The menu uses the Windows per-application output setting. Apps that retain
+The menu writes the Windows per-application output setting. Apps that retain
 their original audio stream may require restarting playback.
 
 ![Output device menu in Windows 11 Quick Settings](https://raw.githubusercontent.com/KKKKeybird/native-audio-router/main/docs/images/taskbar-output-menu.png)
 
-Open Quick Settings and go to Sound output. Windows saves each app's choice.
-On disable, the mod uses its local journal to restore the previous output for
-apps it can still identify, provided the current setting still matches the
-mod's last write. Entries for unavailable sessions are kept locally.
-Testing has focused on Windows 11 AMD64 build 26300.9974 with Windhawk 1.7.3.
+Open Quick Settings and go to Sound output. Each pick is the same per-app
+output setting as Settings > System > Sound > Volume mixer, so Windows saves
+it for the current user and it keeps working after the mod is disabled. The
+mod saves the previous value in a journal that is separate for every Windows
+user. While it unloads, which happens on disable, mod update, and Windhawk
+exit, it restores the entries it can still verify. Apps that are not running
+or not shown in the mixer keep the mod's choice, as does every app when
+ShellHost was not running or the Sound output page was not opened during that
+ShellHost session. Those are ordinary Windows settings: change them per app,
+or use Reset, in Settings > System > Sound > Volume mixer.
+
+Tested on Windows 11 x64 build 26300.9974 with Windhawk 1.7.3. Windhawk also
+builds this mod for ARM64, but that build has not been run or verified. Not
+tested together with Refined Quick Settings and Sound, which changes the same
+volume rows.
 
 ## 中文
 
 在任务栏快捷设置的「声音输出」页中，为应用音量行加入设备菜单。通过行尾
 箭头选择设备或跟随系统默认。部分应用需要重新开始播放，才能切换现有音频流。
-Windows 会记住应用的选择。停用时，模块只恢复仍可识别、且当前输出仍与模块
-上次写入相符的应用。暂时无法访问的会话保留本地恢复记录。
+
+每次选择写入的就是 Windows 自身的逐应用输出设置（与「设置 > 系统 > 声音 >
+音量合成器」相同），由 Windows 按当前用户保存，因此模块停用后仍然有效。
+模块在写入前把原值存入按 Windows 用户分开的恢复日志，并在卸载（停用、模块
+更新或退出 Windhawk）时恢复仍可核对的项目。卸载时未运行或未显示在合成器中
+的应用会保留模块写入的选择；该次 ShellHost 会话未运行或未打开声音输出页时，
+所有应用都会保留。这些选择就是普通的 Windows 设置，可在「设置 > 系统 >
+声音 > 音量合成器」逐项修改或点击「重置」。
+
+已在 Windows 11 x64 构建 26300.9974 与 Windhawk 1.7.3 上测试。Windhawk 也会
+为 ARM64 原生构建本模块，但尚未在 ARM64 上运行或验证。未与 Refined Quick
+Settings and Sound 联合测试，该模块会修改同一批音量行。
 
 See the [project repository](https://github.com/KKKKeybird/native-audio-router)
-for compatibility, test status, and source.
+for source and test status.
 */
 // ==/WindhawkModReadme==
 
 #include <windows.h>
 #include <unknwn.h>
+#include <appmodel.h>
 #include <mmdeviceapi.h>
+#include <sddl.h>
 #include <windhawk_utils.h>
+
+// The MinGW headers bundled with Windhawk omit this Windows SDK constant.
+#ifndef APPLICATION_USER_MODEL_ID_MAX_LENGTH
+#define APPLICATION_USER_MODEL_ID_MAX_LENGTH 130
+#endif
 #undef GetCurrentTime
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -152,12 +179,32 @@ struct Change {
 };
 
 [[clang::no_destroy]] std::vector<Row> rows;
-[[clang::no_destroy]] std::vector<Mixer> mixers;
-[[clang::no_destroy]] std::vector<Change> changes;
-[[clang::no_destroy]] std::vector<CachedOutputs> outputCache;
-constexpr wchar_t journalName[] = L"OutputRestoreJournal";
+std::vector<Mixer> mixers;
+std::vector<Change> changes;
+std::vector<CachedOutputs> outputCache;
+constexpr wchar_t journalPrefix[] = L"OutputRestoreJournal";
 constexpr size_t journalLimit = 16000;
+std::wstring journalName;
 bool journalReady{};
+
+// Windhawk stores mod values machine-wide, while the per-app output setting is
+// per Windows user. Keep one journal per signed-in user.
+std::wstring JournalName() {
+    std::wstring name = journalPrefix;
+    HANDLE token{};
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return name;
+    alignas(TOKEN_USER) unsigned char buffer[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
+    DWORD size{};
+    PWSTR sid{};
+    if (GetTokenInformation(token, TokenUser, buffer, sizeof(buffer), &size) &&
+        ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer)->User.Sid, &sid)) {
+        name += L'_';
+        name += sid;
+        LocalFree(sid);
+    }
+    CloseHandle(token);
+    return name;
+}
 
 bool TakeField(std::wstring_view& remaining, std::wstring_view& value) {
     size_t length{};
@@ -176,7 +223,7 @@ bool TakeField(std::wstring_view& remaining, std::wstring_view& value) {
 
 bool LoadJournal() {
     std::wstring storage(journalLimit + 1, L'\0');
-    const auto count = Wh_GetStringValue(journalName, storage.data(), storage.size());
+    const auto count = Wh_GetStringValue(journalName.c_str(), storage.data(), storage.size());
     if (!count) return true;
     std::wstring_view remaining(storage.data(), count);
     if (!remaining.starts_with(L"1;")) return false;
@@ -206,7 +253,7 @@ bool SaveJournal() noexcept try {
         append(change.applied);
         if (encoded.size() > journalLimit) return false;
     }
-    return Wh_SetStringValue(journalName, encoded.c_str());
+    return Wh_SetStringValue(journalName.c_str(), encoded.c_str());
 } catch (...) {
     return false;
 }
@@ -215,6 +262,7 @@ void StartEndpointWatch() {
     if (endpointWatchAttempted) return;
     endpointWatchAttempted = true;
     try {
+        if (journalName.empty()) journalName = JournalName();
         journalReady = LoadJournal();
     } catch (...) {
         journalReady = false;
@@ -285,12 +333,9 @@ std::wstring AppKey(const F::IInspectable& model) {
 
     winrt::handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid)));
     if (!process) return {};
-    using QueryAppId = LONG (WINAPI*)(HANDLE, UINT32*, PWSTR);
-    const auto queryAppId = reinterpret_cast<QueryAppId>(
-        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetApplicationUserModelId"));
-    wchar_t appId[512]{};
+    wchar_t appId[APPLICATION_USER_MODEL_ID_MAX_LENGTH]{};
     UINT32 size = ARRAYSIZE(appId);
-    if (queryAppId && queryAppId(process.get(), &size, appId) == ERROR_SUCCESS && appId[0]) {
+    if (GetApplicationUserModelId(process.get(), &size, appId) == ERROR_SUCCESS && appId[0]) {
         return L"aumid:" + std::wstring(appId);
     }
     auto path = std::wstring(32768, L'\0');
@@ -711,7 +756,13 @@ void Discover(void* object) noexcept {
             if (!dispatcher || !dispatcher.HasThreadAccess()) return;
         }
         StartEndpointWatch();
-        std::erase_if(mixers, [](const auto& entry) { return !entry.element.get(); });
+        std::erase_if(mixers, [](auto& entry) {
+            if (entry.element.get()) return false;
+            for (const auto& [weakList, token] : entry.containerEvents) {
+                if (const auto list = weakList.get()) list.ContainerContentChanging(token);
+            }
+            return true;
+        });
         if (std::ranges::none_of(mixers, [&mixer](const auto& entry) {
                 return entry.element.get() == mixer;
             })) {

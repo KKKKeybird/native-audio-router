@@ -22,7 +22,7 @@ if ($WindhawkRoot) {
     & $clang '-std=c++23' -O2 -shared -DUNICODE -D_UNICODE -DWH_MOD `
         '-DWH_MOD_ID=L"native-audio-router"' ('-DWH_MOD_VERSION=L"' + $version + '"') `
         (Join-Path $engine '64/windhawk.lib') $file -include windhawk_api.h `
-        -target x86_64-w64-mingw32 '-Wl,--export-all-symbols' -lruntimeobject -loleaut32 -lole32 `
+        -target x86_64-w64-mingw32 '-Wl,--export-all-symbols' -lruntimeobject -loleaut32 -lole32 -ladvapi32 `
         -o (Join-Path $output 'native-audio-router.dll')
     if ($LASTEXITCODE) { throw "Windhawk compiler exited with $LASTEXITCODE" }
 }
