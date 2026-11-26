@@ -9,7 +9,7 @@
 // @homepage https://github.com/KKKKeybird/native-audio-router
 // @architecture x86-64
 // @include ShellHost.exe
-// @compilerOptions -lruntimeobject -loleaut32 -lole32 -ladvapi32
+// @compilerOptions -lruntimeobject -loleaut32 -lole32
 // @license MIT
 // ==/WindhawkMod==
 
@@ -19,21 +19,17 @@
 
 Adds an output-device menu to application volume rows in Windows 11 Quick
 Settings. Use a row's arrow to select a device or follow the system default.
-The menu writes the Windows per-application output setting. Apps that retain
-their original audio stream may require restarting playback.
+Each pick is the same per-application output setting as Settings > System >
+Sound > Volume mixer: Windows saves it for the current user, and it keeps
+working after the mod is disabled or removed.
+
+The mod does not route audio and keeps no copy of the selection. It only adds
+a shortcut to the Windows setting, so there is nothing to restore on unload.
+To change a choice, use the same arrow or the Volume mixer page; choose
+"Default" there to follow the system default again. Apps that retain their
+original audio stream may need playback restarted.
 
 ![Output device menu in Windows 11 Quick Settings](https://raw.githubusercontent.com/KKKKeybird/native-audio-router/main/docs/images/taskbar-output-menu.png)
-
-Open Quick Settings and go to Sound output. Each pick is the same per-app
-output setting as Settings > System > Sound > Volume mixer, so Windows saves
-it for the current user and it keeps working after the mod is disabled. The
-mod saves the previous value in a journal that is separate for every Windows
-user. While it unloads, which happens on disable, mod update, and Windhawk
-exit, it restores the entries it can still verify. Apps that are not running
-or not shown in the mixer keep the mod's choice, as does every app when
-ShellHost was not running or the Sound output page was not opened during that
-ShellHost session. Those are ordinary Windows settings: change them per app,
-or use Reset, in Settings > System > Sound > Volume mixer.
 
 Tested on Windows 11 x64 build 26300.9974 with Windhawk 1.7.3. Windhawk also
 builds this mod for ARM64, but that build has not been run or verified. Not
@@ -43,15 +39,14 @@ volume rows.
 ## 中文
 
 在任务栏快捷设置的「声音输出」页中，为应用音量行加入设备菜单。通过行尾
-箭头选择设备或跟随系统默认。部分应用需要重新开始播放，才能切换现有音频流。
+箭头选择设备或跟随系统默认。每次选择写入的就是 Windows 自身的逐应用输出
+设置（与「设置 > 系统 > 声音 > 音量合成器」相同），由 Windows 按当前用户
+保存，模块停用或移除后仍然有效。
 
-每次选择写入的就是 Windows 自身的逐应用输出设置（与「设置 > 系统 > 声音 >
-音量合成器」相同），由 Windows 按当前用户保存，因此模块停用后仍然有效。
-模块在写入前把原值存入按 Windows 用户分开的恢复日志，并在卸载（停用、模块
-更新或退出 Windhawk）时恢复仍可核对的项目。卸载时未运行或未显示在合成器中
-的应用会保留模块写入的选择；该次 ShellHost 会话未运行或未打开声音输出页时，
-所有应用都会保留。这些选择就是普通的 Windows 设置，可在「设置 > 系统 >
-声音 > 音量合成器」逐项修改或点击「重置」。
+模块不接管音频，也不另存一份选择状态，只是为 Windows 设置提供一个等价的
+快捷入口，因此卸载时没有需要还原的内容。要修改选择，用同一个箭头，或到
+「设置 > 系统 > 声音 > 音量合成器」操作；在那里选择「默认」即可重新跟随
+系统默认。部分应用需要重新开始播放，才能切换现有音频流。
 
 已在 Windows 11 x64 构建 26300.9974 与 Windhawk 1.7.3 上测试。Windhawk 也会
 为 ARM64 原生构建本模块，但尚未在 ARM64 上运行或验证。未与 Refined Quick
@@ -64,15 +59,9 @@ for source and test status.
 
 #include <windows.h>
 #include <unknwn.h>
-#include <appmodel.h>
 #include <mmdeviceapi.h>
-#include <sddl.h>
 #include <windhawk_utils.h>
 
-// The MinGW headers bundled with Windhawk omit this Windows SDK constant.
-#ifndef APPLICATION_USER_MODEL_ID_MAX_LENGTH
-#define APPLICATION_USER_MODEL_ID_MAX_LENGTH 130
-#endif
 #undef GetCurrentTime
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -105,7 +94,6 @@ namespace Core = winrt::Windows::UI::Core;
 HRESULT (WINAPI* originalTemplate)(void*);
 HRESULT (WINAPI* originalFocus)(void*, void*);
 void (WINAPI* originalLoaded)(void*, void*, void*);
-HRESULT (WINAPI* getQuickActionId)(IUnknown*, void**);
 decltype(&LoadLibraryExW) originalLoadLibraryExW;
 std::atomic_bool stopping{};
 std::atomic_bool watchReady{};
@@ -170,107 +158,20 @@ struct CachedOutputs {
     Selection selection;
 };
 
-struct Change {
+struct Pending {
     winrt::weak_ref<F::IInspectable> model;
-    std::wstring appKey;
-    winrt::hstring original;
     winrt::hstring applied;
     ULONGLONG verifyUntil{};
 };
 
 [[clang::no_destroy]] std::vector<Row> rows;
 std::vector<Mixer> mixers;
-std::vector<Change> changes;
+std::vector<Pending> pendingSelections;
 std::vector<CachedOutputs> outputCache;
-constexpr wchar_t journalPrefix[] = L"OutputRestoreJournal";
-constexpr size_t journalLimit = 16000;
-std::wstring journalName;
-bool journalReady{};
-
-// Windhawk stores mod values machine-wide, while the per-app output setting is
-// per Windows user. Keep one journal per signed-in user.
-std::wstring JournalName() {
-    std::wstring name = journalPrefix;
-    HANDLE token{};
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return name;
-    alignas(TOKEN_USER) unsigned char buffer[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
-    DWORD size{};
-    PWSTR sid{};
-    if (GetTokenInformation(token, TokenUser, buffer, sizeof(buffer), &size) &&
-        ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer)->User.Sid, &sid)) {
-        name += L'_';
-        name += sid;
-        LocalFree(sid);
-    }
-    CloseHandle(token);
-    return name;
-}
-
-bool TakeField(std::wstring_view& remaining, std::wstring_view& value) {
-    size_t length{};
-    size_t digits{};
-    while (digits < remaining.size() && remaining[digits] >= L'0' && remaining[digits] <= L'9') {
-        length = length * 10 + (remaining[digits++] - L'0');
-        if (length > journalLimit) return false;
-    }
-    if (!digits || !length || digits >= remaining.size() || remaining[digits] != L':' ||
-        length > remaining.size() - digits - 1) return false;
-    remaining.remove_prefix(digits + 1);
-    value = remaining.substr(0, length);
-    remaining.remove_prefix(length);
-    return true;
-}
-
-bool LoadJournal() {
-    std::wstring storage(journalLimit + 1, L'\0');
-    const auto count = Wh_GetStringValue(journalName.c_str(), storage.data(), storage.size());
-    if (!count) return true;
-    std::wstring_view remaining(storage.data(), count);
-    if (!remaining.starts_with(L"1;")) return false;
-    remaining.remove_prefix(2);
-    while (!remaining.empty()) {
-        std::wstring_view appKey, original, applied;
-        if (!TakeField(remaining, appKey) || !TakeField(remaining, original) ||
-            !TakeField(remaining, applied)) return false;
-        if (std::ranges::any_of(changes, [appKey](const auto& change) { return change.appKey == appKey; })) {
-            return false;
-        }
-        changes.push_back({{}, std::wstring(appKey), winrt::hstring(original), winrt::hstring(applied), 0});
-    }
-    return true;
-}
-
-bool SaveJournal() noexcept try {
-    std::wstring encoded(L"1;");
-    const auto append = [&encoded](std::wstring_view value) {
-        encoded += std::to_wstring(value.size());
-        encoded += L':';
-        encoded += value;
-    };
-    for (const auto& change : changes) {
-        append(change.appKey);
-        append(change.original);
-        append(change.applied);
-        if (encoded.size() > journalLimit) return false;
-    }
-    return Wh_SetStringValue(journalName.c_str(), encoded.c_str());
-} catch (...) {
-    return false;
-}
 
 void StartEndpointWatch() {
     if (endpointWatchAttempted) return;
     endpointWatchAttempted = true;
-    try {
-        if (journalName.empty()) journalName = JournalName();
-        journalReady = LoadJournal();
-    } catch (...) {
-        journalReady = false;
-    }
-    if (!journalReady) {
-        std::vector<Change>().swap(changes);
-        Wh_Log(L"Output restoration journal was unreadable; output writes are disabled");
-    }
     try {
         winrt::com_ptr<IMMDeviceEnumerator> enumerator;
         winrt::check_hresult(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
@@ -310,41 +211,6 @@ F::IInspectable Model(const C::Slider& slider) {
     return nullptr;
 }
 
-std::wstring AppKey(const F::IInspectable& model) {
-    // The IID and get_Id signature are from the matched ControlCenter PDB.
-    constexpr GUID quickActionIid{0x1089de08, 0x4584, 0x4386,
-                                  {0x85, 0x83, 0x3e, 0xda, 0xf3, 0x65, 0x70, 0x0d}};
-    constexpr std::wstring_view prefix = L"SystemSettings_Audio_Mixer_App";
-    if (!model || !getQuickActionId) return {};
-    winrt::com_ptr<IUnknown> action;
-    if (FAILED(model.as<IUnknown>()->QueryInterface(quickActionIid, action.put_void()))) return {};
-    winrt::hstring id;
-    if (FAILED(getQuickActionId(action.get(), winrt::put_abi(id)))) return {};
-    std::wstring_view suffix = id;
-    if (!suffix.starts_with(prefix)) return {};
-    suffix.remove_prefix(prefix.size());
-    if (suffix.empty() || suffix.size() > 10) return {};
-    uint64_t pid{};
-    for (wchar_t ch : suffix) {
-        if (ch < L'0' || ch > L'9') return {};
-        pid = pid * 10 + ch - L'0';
-    }
-    if (!pid || pid > MAXDWORD) return {};
-
-    winrt::handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid)));
-    if (!process) return {};
-    wchar_t appId[APPLICATION_USER_MODEL_ID_MAX_LENGTH]{};
-    UINT32 size = ARRAYSIZE(appId);
-    if (GetApplicationUserModelId(process.get(), &size, appId) == ERROR_SUCCESS && appId[0]) {
-        return L"aumid:" + std::wstring(appId);
-    }
-    auto path = std::wstring(32768, L'\0');
-    DWORD length = static_cast<DWORD>(path.size());
-    if (!QueryFullProcessImageNameW(process.get(), 0, path.data(), &length)) return {};
-    path.resize(length);
-    return L"exe:" + path;
-}
-
 std::optional<uint32_t> ReadSelectedIndex(const F::IInspectable& model) {
     const auto selected = Property(model, L"SelectedOutput");
     if (!selected || !selected.CanRead()) return std::nullopt;
@@ -378,26 +244,24 @@ bool UniqueName(const Selection& state, const winrt::hstring& name) {
     return std::ranges::count(state.names, name) == 1;
 }
 
-auto FindChange(const F::IInspectable& model) {
-    auto change = std::ranges::find_if(changes, [&model](const auto& entry) {
+auto FindPending(const F::IInspectable& model) {
+    const auto now = GetTickCount64();
+    std::erase_if(pendingSelections, [now](const auto& entry) {
+        return !entry.model.get() || (entry.verifyUntil && now >= entry.verifyUntil);
+    });
+    return std::ranges::find_if(pendingSelections, [&model](const auto& entry) {
         return entry.model.get() == model;
     });
-    if (change != changes.end() || !journalReady || changes.empty()) return change;
-    const auto key = AppKey(model);
-    if (key.empty()) return changes.end();
-    change = std::ranges::find(changes, key, &Change::appKey);
-    if (change != changes.end()) change->model = winrt::make_weak(model);
-    return change;
 }
 
 void UpdateMenuIndex(const F::IInspectable& model, Selection& selection,
                      std::optional<uint32_t> reported) {
-    const auto change = FindChange(model);
-    if (change != changes.end() && GetTickCount64() < change->verifyUntil) {
-        const auto requested = std::ranges::find(selection.names, change->applied);
-        if (requested != selection.names.end() && UniqueName(selection, change->applied)) {
+    const auto pending = FindPending(model);
+    if (pending != pendingSelections.end() && GetTickCount64() < pending->verifyUntil) {
+        const auto requested = std::ranges::find(selection.names, pending->applied);
+        if (requested != selection.names.end() && UniqueName(selection, pending->applied)) {
             const auto index = static_cast<uint32_t>(requested - selection.names.begin());
-            if (reported && *reported == index) change->verifyUntil = 0;
+            if (reported && *reported == index) pending->verifyUntil = 0;
             selection.index = static_cast<int32_t>(index);
             return;
         }
@@ -406,7 +270,6 @@ void UpdateMenuIndex(const F::IInspectable& model, Selection& selection,
 }
 
 void Select(const F::IInspectable& model, const Selection& shown, int32_t index) {
-    if (!journalReady) return;
     const auto current = ReadSelection(model);
     if (!current) return;
     if (current->names != shown.names) {
@@ -417,50 +280,34 @@ void Select(const F::IInspectable& model, const Selection& shown, int32_t index)
         !UniqueName(*current, current->names[current->index])) {
         return;
     }
-    auto change = FindChange(model);
+    auto pending = FindPending(model);
     const auto now = GetTickCount64();
     const auto& reported = current->names[current->index];
     const auto& requested = current->names[index];
-    const bool awaiting = change != changes.end() && now < change->verifyUntil;
-    if (awaiting ? change->applied == requested : current->index == index) return;
-    const bool newChange = change == changes.end();
-    auto key = newChange ? AppKey(model) : change->appKey;
-    if (key.empty()) {
-        Wh_Log(L"Output change skipped: application identity unavailable");
-        return;
-    }
+    const bool awaiting = pending != pendingSelections.end() && now < pending->verifyUntil;
+    if (awaiting ? pending->applied == requested : current->index == index) return;
     const auto property = Property(model, L"SelectedOutput");
-    const auto value = winrt::box_value(static_cast<uint32_t>(index));
     if (!property) return;
-    std::optional<Change> previous;
-    if (newChange) {
-        changes.push_back({winrt::make_weak(model), std::move(key), reported, requested, 0});
-        change = changes.end() - 1;
+    winrt::hstring previous;
+    const bool added = pending == pendingSelections.end();
+    if (added) {
+        pendingSelections.push_back({winrt::make_weak(model), requested, 0});
+        pending = pendingSelections.end() - 1;
     } else {
-        previous = *change;
-        if (!awaiting && change->applied != reported) change->original = reported;
-        change->applied = requested;
-    }
-    const auto revertJournal = [&] {
-        if (previous) {
-            *change = std::move(*previous);
-        } else {
-            changes.pop_back();
-        }
-    };
-    if (!SaveJournal()) {
-        revertJournal();
-        Wh_Log(L"Output change skipped: could not save original output");
-        return;
+        previous = pending->applied;
+        pending->applied = requested;
     }
     try {
-        property.SetValue(model, value);
+        property.SetValue(model, winrt::box_value(static_cast<uint32_t>(index)));
     } catch (...) {
-        revertJournal();
-        journalReady = SaveJournal();
+        if (added) {
+            pendingSelections.pop_back();
+        } else {
+            pending->applied = previous;
+        }
         throw;
     }
-    change->verifyUntil = GetTickCount64() + 1500;
+    pending->verifyUntil = GetTickCount64() + 1500;
     Wh_Log(L"Requested native output index %d", index);
 }
 
@@ -589,8 +436,6 @@ void AddRow(const C::Slider& slider) {
     }
     const auto model = Model(slider);
     if (!model) return;
-    FindChange(model);
-
     C::Button button;
     C::ColumnDefinition column;
     C::MenuFlyout menu;
@@ -632,8 +477,8 @@ void AddRow(const C::Slider& slider) {
                 return entry.generation == generation && entry.model.get() == model;
             });
             if (cached != outputCache.end()) {
-                const auto change = FindChange(model);
-                const bool awaiting = change != changes.end() && GetTickCount64() < change->verifyUntil;
+                const auto pending = FindPending(model);
+                const bool awaiting = pending != pendingSelections.end() && GetTickCount64() < pending->verifyUntil;
                 const auto selected = awaiting ? std::nullopt : ReadSelectedIndex(model);
                 if ((awaiting || (selected && *selected < cached->selection.names.size())) &&
                     generation == endpointGeneration.load()) {
@@ -796,7 +641,7 @@ void WINAPI OnLoaded(void* object, void* sender, void* args) {
     if (retained) Discover(retained.get());
 }
 
-void Restore() {
+void Teardown() {
     if (endpointEnumerator) {
         const auto result = endpointEnumerator->UnregisterEndpointNotificationCallback(endpointNotifications.get());
         if (FAILED(result)) {
@@ -816,45 +661,14 @@ void Restore() {
     std::vector<Mixer>().swap(mixers);
     for (auto& row : rows) {
         try {
-            if (const auto slider = row.slider.get(); slider && journalReady && !changes.empty()) {
-                FindChange(Model(slider));
-            }
-        } catch (...) {
-            Wh_Log(L"Could not recover the row's application identity");
-        }
-        try {
             RemoveRow(row);
         } catch (...) {
-            Wh_Log(L"Could not restore a mixer row (0x%08X)",
+            Wh_Log(L"Could not detach a mixer row (0x%08X)",
                    static_cast<unsigned>(winrt::to_hresult().value));
         }
     }
     std::vector<Row>().swap(rows);
-    if (journalReady && !changes.empty()) {
-        std::erase_if(changes, [](const auto& change) {
-            try {
-                const auto model = change.model.get();
-                const auto state = ReadSelection(model);
-                if (!state) return false;
-                if (state->names[state->index] != change.applied) {
-                    return GetTickCount64() >= change.verifyUntil;
-                }
-                if (change.original == change.applied) return true;
-                if (!UniqueName(*state, change.original)) return false;
-                const auto index = std::ranges::find(state->names, change.original) - state->names.begin();
-                const auto property = Property(model, L"SelectedOutput");
-                if (!property) return false;
-                property.SetValue(model, winrt::box_value(static_cast<uint32_t>(index)));
-                const auto restored = ReadSelection(model);
-                return restored && restored->names[restored->index] == change.original;
-            } catch (...) {
-                Wh_Log(L"Output restoration failed (0x%08X)", static_cast<unsigned>(winrt::to_hresult().value));
-                return false;
-            }
-        });
-        if (!SaveJournal()) Wh_Log(L"Could not update the output restoration journal");
-    }
-    std::vector<Change>().swap(changes);
+    std::vector<Pending>().swap(pendingSelections);
     std::lock_guard lock(dispatcherLock);
     dispatcher = nullptr;
 }
@@ -867,8 +681,6 @@ bool HookControlCenter(HMODULE module) {
          &originalFocus, OnFocus, true},
         {{LR"(public: void __cdecl winrt::ControlCenter::implementation::VolumeMixerList::OnVolumeMixerListLoaded(struct winrt::Windows::Foundation::IInspectable,struct winrt::Windows::UI::Xaml::RoutedEventArgs))"},
          &originalLoaded, OnLoaded},
-        {{LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::ControlCenter::implementation::QuickActionViewModel,struct winrt::Windows::Internal::QuickActions::IQuickAction>::get_Id(void * *))"},
-         &getQuickActionId},
     };
     const bool resolved = WindhawkUtils::HookSymbols(module, controlCenterDllHooks,
                                                     ARRAYSIZE(controlCenterDllHooks));
@@ -934,9 +746,9 @@ void Wh_ModBeforeUninit() {
     if (!ui) return;
     try {
         if (ui.HasThreadAccess()) {
-            Restore();
+            Teardown();
         } else {
-            ui.RunAsync(Core::CoreDispatcherPriority::High, [] { Restore(); }).get();
+            ui.RunAsync(Core::CoreDispatcherPriority::High, [] { Teardown(); }).get();
         }
     } catch (...) {
         Wh_Log(L"Mixer teardown failed (0x%08X)", static_cast<unsigned>(winrt::to_hresult().value));
